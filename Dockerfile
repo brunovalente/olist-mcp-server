@@ -5,6 +5,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Playwright Chromium + deps de sistema (para tools UI v0)
+RUN playwright install-deps chromium \
+    && playwright install chromium
+
 COPY swagger.json .
 COPY src/ ./src/
 RUN mkdir -p /app/data
@@ -30,6 +34,12 @@ ENV OAUTH_REDIRECT_URI="http://localhost:47321/auth/callback"
 ENV OAUTH_AUTH_URL=""
 ENV OAUTH_TOKEN_URL=""
 ENV OAUTH_SCOPE="openid"
+
+# UI v0 (Playwright)
+ENV OLIST_UI_BASE_URL="https://erp.olist.com"
+ENV OLIST_UI_SESSION_FILE="/app/data/ui-v0-session.json"
+ENV OLIST_UI_LOG_FILE="/app/data/ui-v0.log"
+ENV OLIST_UI_HEADLESS="true"
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD python -c "import httpx; httpx.get('http://localhost:47321/health', timeout=5.0)" || exit 1

@@ -16,6 +16,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from src.oauth import AUTH_URL, OAuthTokenManager
 from src.token_auth import get_token_manager as get_api_token_manager
 from src.tools_generator import register_tools
+from src.ui_v0_tools import register_ui_v0_tools
 
 # Server config from env
 SERVER_NAME = os.getenv("MCP_SERVER_NAME", "swagger-mcp")
@@ -64,6 +65,10 @@ mcp = FastMCP(
 # Register all tools from swagger spec (auto-fetches latest from remote, falls back to cache)
 tool_count = register_tools(mcp)
 print(f"Registered {tool_count} tools")
+
+# UI v0 tools (Playwright) — gaps nao cobertos pela API oficial
+ui_v0_count = register_ui_v0_tools(mcp, get_token_manager)
+print(f"Registered {ui_v0_count} UI v0 tools")
 
 
 # ---------------------------------------------------------------------------
