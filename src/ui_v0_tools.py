@@ -130,10 +130,11 @@ async def _do_trocar_transportador(id_nota: str, nome: str, cnpj: str, ie: str, 
         page = await ctx.new_page()
         try:
             await page.goto(f"{base_url}/notas_fiscais#edit/{id_nota}", wait_until="domcontentloaded")
-            if "login" in page.url.lower() or "accounts.tiny.com.br" in page.url.lower():
+            landed_url = page.url
+            if "login" in landed_url.lower() or "accounts.tiny.com.br" in landed_url.lower():
                 await browser.close()
                 if not _retry:
-                    raise RuntimeError("sessao UI expirou mesmo apos auto-login; investigar")
+                    raise RuntimeError(f"sessao UI expirou mesmo apos auto-login; landed em {landed_url}")
                 try:
                     Path(session_state).unlink()
                 except Exception:
