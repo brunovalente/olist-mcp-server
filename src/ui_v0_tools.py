@@ -66,85 +66,74 @@ def _get_session_state_path() -> str:
     return _env("OLIST_UI_SESSION_FILE", "/app/data/ui-v0-session.json")
 
 
-async def _do_login_headless() -> str:
-    """Auto-login no Tiny usando OLIST_UI_USER/OLIST_UI_PASSWORD. Retorna path da sessao."""
-    from playwright.async_api import async_playwright
+async def _login_on_page(page) -> None:
+    """Faz login na pagina atual usando OLIST_UI_USER/OLIST_UI_PASSWORD.
+
+    Nao fecha/reabre browser. Necessario porque reabrir o contexto com
+    storage_state recem-salvo dispara invalidacao de sessao pelo Olist
+    (detecta como novo dispositivo) e redireciona pra /login/.
+    """
     user = _env("OLIST_UI_USER")
     password = _env("OLIST_UI_PASSWORD")
     if not user or not password:
         raise RuntimeError("OLIST_UI_USER/OLIST_UI_PASSWORD ausentes no ambiente do container")
-    base_url = _env("OLIST_UI_BASE_URL", "https://erp.olist.com").rstrip("/")
-    sess = _get_session_state_path()
-    Path(sess).parent.mkdir(parents=True, exist_ok=True)
-    started = time.time()
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        try:
-            ctx = await browser.new_context(viewport={"width": 1920, "height": 1080})
-            page = await ctx.new_page()
-            await page.goto(base_url, wait_until="networkidle", timeout=30000)
-            await page.locator('input[name="username"]').fill(user)
-            await page.locator('input[name="password"]').fill(password)
-            try:
-                await page.locator('button[type="submit"], input[type="submit"]').first.click()
-            except Exception:
-                await page.keyboard.press("Enter")
-            await page.wait_for_load_state("networkidle", timeout=30000)
-            url = page.url.lower()
-            if "login" in url or "accounts.tiny.com.br" in url:
-                raise RuntimeError(
-                    "auto-login falhou: continua em pagina de login (credenciais invalidas, captcha ou MFA)"
-                )
-            await ctx.storage_state(path=sess)
-        finally:
-            await browser.close()
+    await page.locator('input[name="username"]').fill(user)
+    await page.locator('input[name="password"]').fill(password)
     try:
-        os.chmod(sess, 0o600)
+        await page.locator('button[type="submit"], input[type="submit"]').first.click()
     except Exception:
-        pass
-    _log("session-refresh", sess, "ok", started)
-    return sess
-
-
-async def _ensure_session() -> str:
-    sess = _get_session_state_path()
-    if not Path(sess).exists():
-        return await _do_login_headless()
-    return sess
+        await page.keyboard.press("Enter")
+    await page.wait_for_load_state("networkidle", timeout=30000)
+    url = page.url.lower()
+    if "login" in url or "accounts.tiny.com.br" in url:
+        raise RuntimeError(
+            "login falhou: continua em pagina de login (credenciais invalidas, captcha ou MFA)"
+        )
 
 
 # ---------------------------------------------------------------------------
 # Implementacoes das operacoes
 # ---------------------------------------------------------------------------
 
-async def _do_trocar_transportador(id_nota: str, nome: str, cnpj: str, ie: str, _retry: bool = True) -> dict:
+async def _do_trocar_transportador(id_nota: str, nome: str, cnpj: str, ie: str) -> dict:
     from playwright.async_api import async_playwright
 
     base_url = _env("OLIST_UI_BASE_URL", "https://erp.olist.com").rstrip("/")
     headless = _env("OLIST_UI_HEADLESS", "true").lower() != "false"
-    session_state = await _ensure_session()
+    sess = _get_session_state_path()
+    has_session = Path(sess).exists()
+    nf_url = f"{base_url}/notas_fiscais#edit/{id_nota}"
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless)
-        ctx = await browser.new_context(storage_state=session_state, viewport={"width": 1920, "height": 1080})
+        ctx_kwargs = {"viewport": {"width": 1920, "height": 1080}}
+        if has_session:
+            ctx_kwargs["storage_state"] = sess
+        ctx = await browser.new_context(**ctx_kwargs)
         page = await ctx.new_page()
         try:
-            await page.goto(f"{base_url}/notas_fiscais#edit/{id_nota}", wait_until="domcontentloaded")
-            landed_url = page.url
-            if "login" in landed_url.lower() or "accounts.tiny.com.br" in landed_url.lower():
-                await browser.close()
-                if not _retry:
-                    raise RuntimeError(f"sessao UI expirou mesmo apos auto-login; landed em {landed_url}")
+            started_login = time.time()
+            login_needed = not has_session
+            if has_session:
+                await page.goto(nf_url, wait_until="domcontentloaded")
+                url_low = page.url.lower()
+                if "login" in url_low or "accounts.tiny.com.br" in url_low:
+                    login_needed = True
+            if login_needed:
+                if not has_session:
+                    await page.goto(base_url, wait_until="networkidle", timeout=30000)
+                await _login_on_page(page)
+                Path(sess).parent.mkdir(parents=True, exist_ok=True)
+                await ctx.storage_state(path=sess)
                 try:
-                    Path(session_state).unlink()
+                    os.chmod(sess, 0o600)
                 except Exception:
                     pass
-                await _do_login_headless()
-                return await _do_trocar_transportador(id_nota, nome, cnpj, ie, _retry=False)
+                _log("session-refresh", sess, "ok", started_login)
+                await page.goto(nf_url, wait_until="domcontentloaded")
 
             # Modal "Este usuario ja esta logado em outro dispositivo": clicar "login"
-            # para assumir a sessao. O Olist limita sessoes concorrentes por usuario;
-            # sem isso o fluxo fica travado no modal e estouramos timeout adiante.
+            # para assumir a sessao (Olist limita sessoes concorrentes por usuario).
             try:
                 modal = page.get_by_text("já está logado em outro dispositivo", exact=False)
                 if await modal.count() > 0:
