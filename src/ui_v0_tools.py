@@ -112,16 +112,18 @@ async def _do_trocar_transportador(id_nota: str, nome: str, cnpj: str, ie: str) 
         ctx = await browser.new_context(**ctx_kwargs)
         page = await ctx.new_page()
         try:
-            started_login = time.time()
-            login_needed = not has_session
-            if has_session:
-                await page.goto(nf_url, wait_until="domcontentloaded")
-                url_low = page.url.lower()
-                if "login" in url_low or "accounts.tiny.com.br" in url_low:
-                    login_needed = True
-            if login_needed:
-                if not has_session:
-                    await page.goto(base_url, wait_until="networkidle", timeout=30000)
+            await page.goto(nf_url, wait_until="domcontentloaded")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=20000)
+            except Exception:
+                pass
+
+            # Se apareceu o form de login (fluxo accounts.tiny.com.br ou
+            # /login/ sem session_state), faz login inline no mesmo contexto.
+            # IMPORTANTE: nao fechar o browser entre login e NF (isso dispara
+            # invalidacao de sessao por detecao de novo dispositivo).
+            if await page.locator('input[name="username"]').count() > 0:
+                started_login = time.time()
                 await _login_on_page(page)
                 Path(sess).parent.mkdir(parents=True, exist_ok=True)
                 await ctx.storage_state(path=sess)
@@ -131,16 +133,13 @@ async def _do_trocar_transportador(id_nota: str, nome: str, cnpj: str, ie: str) 
                     pass
                 _log("session-refresh", sess, "ok", started_login)
                 await page.goto(nf_url, wait_until="domcontentloaded")
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=20000)
+                except Exception:
+                    pass
 
-            # Aguarda o SPA carregar (modal e conteudo da NF sao renderizados
-            # por JS depois do domcontentloaded).
-            try:
-                await page.wait_for_load_state("networkidle", timeout=20000)
-            except Exception:
-                pass
-
-            # Modal "Este usuario ja esta logado em outro dispositivo": clicar "login"
-            # para assumir a sessao (Olist limita sessoes concorrentes por usuario).
+            # Modal "Este usuario ja esta logado em outro dispositivo": clicar
+            # "login" para assumir a sessao (Olist limita sessoes concorrentes).
             try:
                 await page.wait_for_selector(
                     "text=já está logado em outro dispositivo", timeout=5000
