@@ -66,9 +66,9 @@ def _get_session_state_path() -> str:
     return _env("OLIST_UI_SESSION_FILE", "/app/data/ui-v0-session.json")
 
 
-def _do_login_headless() -> str:
+async def _do_login_headless() -> str:
     """Auto-login no Tiny usando OLIST_UI_USER/OLIST_UI_PASSWORD. Retorna path da sessao."""
-    from playwright.sync_api import sync_playwright
+    from playwright.async_api import async_playwright
     user = _env("OLIST_UI_USER")
     password = _env("OLIST_UI_PASSWORD")
     if not user or not password:
@@ -77,27 +77,27 @@ def _do_login_headless() -> str:
     sess = _get_session_state_path()
     Path(sess).parent.mkdir(parents=True, exist_ok=True)
     started = time.time()
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
         try:
-            ctx = browser.new_context(viewport={"width": 1920, "height": 1080})
-            page = ctx.new_page()
-            page.goto(base_url, wait_until="networkidle", timeout=30000)
-            page.locator('input[name="username"]').fill(user)
-            page.locator('input[name="password"]').fill(password)
+            ctx = await browser.new_context(viewport={"width": 1920, "height": 1080})
+            page = await ctx.new_page()
+            await page.goto(base_url, wait_until="networkidle", timeout=30000)
+            await page.locator('input[name="username"]').fill(user)
+            await page.locator('input[name="password"]').fill(password)
             try:
-                page.locator('button[type="submit"], input[type="submit"]').first.click()
+                await page.locator('button[type="submit"], input[type="submit"]').first.click()
             except Exception:
-                page.keyboard.press("Enter")
-            page.wait_for_load_state("networkidle", timeout=30000)
+                await page.keyboard.press("Enter")
+            await page.wait_for_load_state("networkidle", timeout=30000)
             url = page.url.lower()
             if "login" in url or "accounts.tiny.com.br" in url:
                 raise RuntimeError(
                     "auto-login falhou: continua em pagina de login (credenciais invalidas, captcha ou MFA)"
                 )
-            ctx.storage_state(path=sess)
+            await ctx.storage_state(path=sess)
         finally:
-            browser.close()
+            await browser.close()
     try:
         os.chmod(sess, 0o600)
     except Exception:
@@ -106,10 +106,10 @@ def _do_login_headless() -> str:
     return sess
 
 
-def _ensure_session() -> str:
+async def _ensure_session() -> str:
     sess = _get_session_state_path()
     if not Path(sess).exists():
-        return _do_login_headless()
+        return await _do_login_headless()
     return sess
 
 
@@ -117,44 +117,43 @@ def _ensure_session() -> str:
 # Implementacoes das operacoes
 # ---------------------------------------------------------------------------
 
-def _do_trocar_transportador(id_nota: str, nome: str, cnpj: str, ie: str, _retry: bool = True) -> dict:
-    from playwright.sync_api import sync_playwright
+async def _do_trocar_transportador(id_nota: str, nome: str, cnpj: str, ie: str, _retry: bool = True) -> dict:
+    from playwright.async_api import async_playwright
 
     base_url = _env("OLIST_UI_BASE_URL", "https://erp.olist.com").rstrip("/")
     headless = _env("OLIST_UI_HEADLESS", "true").lower() != "false"
-    session_state = _ensure_session()
+    session_state = await _ensure_session()
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=headless)
-        ctx = browser.new_context(storage_state=session_state, viewport={"width": 1920, "height": 1080})
-        page = ctx.new_page()
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=headless)
+        ctx = await browser.new_context(storage_state=session_state, viewport={"width": 1920, "height": 1080})
+        page = await ctx.new_page()
         try:
-            page.goto(f"{base_url}/notas_fiscais#edit/{id_nota}", wait_until="domcontentloaded")
+            await page.goto(f"{base_url}/notas_fiscais#edit/{id_nota}", wait_until="domcontentloaded")
             if "login" in page.url.lower() or "accounts.tiny.com.br" in page.url.lower():
-                browser.close()
+                await browser.close()
                 if not _retry:
                     raise RuntimeError("sessao UI expirou mesmo apos auto-login; investigar")
-                # apaga sessao, refaz login, retenta uma vez
                 try:
                     Path(session_state).unlink()
                 except Exception:
                     pass
-                _do_login_headless()
-                return _do_trocar_transportador(id_nota, nome, cnpj, ie, _retry=False)
+                await _do_login_headless()
+                return await _do_trocar_transportador(id_nota, nome, cnpj, ie, _retry=False)
 
             # Modal "Este usuario ja esta logado em outro dispositivo": clicar "login"
             # para assumir a sessao. O Olist limita sessoes concorrentes por usuario;
             # sem isso o fluxo fica travado no modal e estouramos timeout adiante.
             try:
                 modal = page.get_by_text("já está logado em outro dispositivo", exact=False)
-                if modal.count() > 0:
-                    page.get_by_role("button", name="login", exact=False).first.click()
-                    page.wait_for_load_state("networkidle", timeout=20000)
+                if await modal.count() > 0:
+                    await page.get_by_role("button", name="login", exact=False).first.click()
+                    await page.wait_for_load_state("networkidle", timeout=20000)
             except Exception:
-                pass  # modal nao apareceu — segue o fluxo
+                pass
 
-            page.wait_for_load_state("networkidle", timeout=20000)
-            page.wait_for_selector("text=Transportador / Volumes", timeout=30000)
+            await page.wait_for_load_state("networkidle", timeout=20000)
+            await page.wait_for_selector("text=Transportador / Volumes", timeout=30000)
 
             set_js = """
             (args) => {
@@ -170,20 +169,20 @@ def _do_trocar_transportador(id_nota: str, nome: str, cnpj: str, ie: str, _retry
             }
             """
             for field, value in [("transportador", nome), ("cnpjTransportador", cnpj), ("ieTransportador", ie)]:
-                r = page.evaluate(set_js, [field, value])
+                r = await page.evaluate(set_js, [field, value])
                 if not r.get("ok"):
                     raise RuntimeError(f"falha ao setar {field}: {r}")
 
-            r = page.evaluate("""() => {
+            r = await page.evaluate("""() => {
               if (typeof salvarNotaFiscal !== 'function') return {ok:false, reason:'funcao salvarNotaFiscal ausente'};
               salvarNotaFiscal();
               return {ok:true};
             }""")
             if not r.get("ok"):
                 raise RuntimeError(f"falha ao clicar salvar: {r}")
-            page.wait_for_load_state("networkidle", timeout=30000)
+            await page.wait_for_load_state("networkidle", timeout=30000)
         finally:
-            browser.close()
+            await browser.close()
 
     return {"ok": True}
 
@@ -217,8 +216,6 @@ def register_ui_v0_tools(mcp: FastMCP, get_oauth: callable) -> int:
         cnpj: str | None = None,
         ie: str | None = None,
     ) -> dict:
-        import asyncio
-
         started = time.time()
         try:
             oauth = get_oauth()
@@ -256,8 +253,7 @@ def register_ui_v0_tools(mcp: FastMCP, get_oauth: callable) -> int:
             nome_f, cnpj_f, ie_f = nome, cnpj, ie or ""
 
         try:
-            # Playwright sync_api precisa rodar fora do event loop
-            await asyncio.to_thread(_do_trocar_transportador, idNota, nome_f, cnpj_f, ie_f)
+            await _do_trocar_transportador(idNota, nome_f, cnpj_f, ie_f)
         except Exception as e:
             _log("trocar_transportador", idNota, "erro-ui", started, {"erro": str(e)})
             motivo = "sessao-expirada" if "sessao" in str(e).lower() else "falha-automacao"
