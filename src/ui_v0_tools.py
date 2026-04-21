@@ -132,17 +132,24 @@ async def _do_trocar_transportador(id_nota: str, nome: str, cnpj: str, ie: str) 
                 _log("session-refresh", sess, "ok", started_login)
                 await page.goto(nf_url, wait_until="domcontentloaded")
 
-            # Modal "Este usuario ja esta logado em outro dispositivo": clicar "login"
-            # para assumir a sessao (Olist limita sessoes concorrentes por usuario).
+            # Aguarda o SPA carregar (modal e conteudo da NF sao renderizados
+            # por JS depois do domcontentloaded).
             try:
-                modal = page.get_by_text("já está logado em outro dispositivo", exact=False)
-                if await modal.count() > 0:
-                    await page.get_by_role("button", name="login", exact=False).first.click()
-                    await page.wait_for_load_state("networkidle", timeout=20000)
+                await page.wait_for_load_state("networkidle", timeout=20000)
             except Exception:
                 pass
 
-            await page.wait_for_load_state("networkidle", timeout=20000)
+            # Modal "Este usuario ja esta logado em outro dispositivo": clicar "login"
+            # para assumir a sessao (Olist limita sessoes concorrentes por usuario).
+            try:
+                await page.wait_for_selector(
+                    "text=já está logado em outro dispositivo", timeout=5000
+                )
+                await page.get_by_role("button", name="login", exact=False).first.click()
+                await page.wait_for_load_state("networkidle", timeout=20000)
+            except Exception:
+                pass
+
             await page.wait_for_selector("text=Transportador / Volumes", timeout=30000)
 
             set_js = """
