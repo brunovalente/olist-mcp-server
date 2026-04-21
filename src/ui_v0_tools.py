@@ -129,7 +129,7 @@ def _do_trocar_transportador(id_nota: str, nome: str, cnpj: str, ie: str, _retry
         ctx = browser.new_context(storage_state=session_state, viewport={"width": 1920, "height": 1080})
         page = ctx.new_page()
         try:
-            page.goto(f"{base_url}/notas_fiscais#edit/{id_nota}", wait_until="networkidle")
+            page.goto(f"{base_url}/notas_fiscais#edit/{id_nota}", wait_until="domcontentloaded")
             if "login" in page.url.lower() or "accounts.tiny.com.br" in page.url.lower():
                 browser.close()
                 if not _retry:
@@ -142,6 +142,18 @@ def _do_trocar_transportador(id_nota: str, nome: str, cnpj: str, ie: str, _retry
                 _do_login_headless()
                 return _do_trocar_transportador(id_nota, nome, cnpj, ie, _retry=False)
 
+            # Modal "Este usuario ja esta logado em outro dispositivo": clicar "login"
+            # para assumir a sessao. O Olist limita sessoes concorrentes por usuario;
+            # sem isso o fluxo fica travado no modal e estouramos timeout adiante.
+            try:
+                modal = page.get_by_text("já está logado em outro dispositivo", exact=False)
+                if modal.count() > 0:
+                    page.get_by_role("button", name="login", exact=False).first.click()
+                    page.wait_for_load_state("networkidle", timeout=20000)
+            except Exception:
+                pass  # modal nao apareceu — segue o fluxo
+
+            page.wait_for_load_state("networkidle", timeout=20000)
             page.wait_for_selector("text=Transportador / Volumes", timeout=30000)
 
             set_js = """
