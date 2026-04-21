@@ -62,6 +62,23 @@ async def _api_get(oauth: OAuthTokenManager, path: str) -> dict:
     return r.json()
 
 
+async def _api_put(oauth: OAuthTokenManager, path: str, body: dict) -> dict:
+    import httpx
+    base = _env("API_BASE_URL", "https://api.tiny.com.br/public-api/v3").rstrip("/")
+    token = await oauth.get_access_token()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.put(
+            f"{base}{path}",
+            headers={"Authorization": f"Bearer {token}"},
+            json=body,
+        )
+    r.raise_for_status()
+    try:
+        return r.json()
+    except Exception:
+        return {"status_code": r.status_code}
+
+
 def _get_session_state_path() -> str:
     return _env("OLIST_UI_SESSION_FILE", "/app/data/ui-v0-session.json")
 
@@ -198,11 +215,16 @@ def register_ui_v0_tools(mcp: FastMCP, get_oauth: callable) -> int:
             "[UI v0] Altera nome, CPF/CNPJ e IE do transportador de uma nota fiscal NAO autorizada. "
             "Usa automacao de browser (Playwright) porque a API oficial v2/v3 nao atualiza o CNPJ do "
             "transportador via PUT /notas/{id}/despacho. "
+            "Se a NF veio de um pedido de venda (nf.origem.tipo=venda) e idContato foi informado, "
+            "tambem atualiza o transportador no pedido via PUT /pedidos/{id}/despacho ANTES da NF, "
+            "para manter pedido e NF alinhados. Se o pedido falhar, aborta sem tocar na NF. Se a NF "
+            "falhar apos o pedido ter sido atualizado, retorna aviso de estado divergente. "
             "Recusa com erro se a NF ja tiver chaveAcesso (autorizada na SEFAZ). "
             "Parametros: idNota (obrigatorio). Informe UMA das opcoes de transportador: idContato "
-            "(recomendado; puxa nome/cpfCnpj/inscricaoEstadual do cadastro) OU nome+cnpj+ie literais. "
+            "(recomendado; puxa nome/cpfCnpj/inscricaoEstadual do cadastro E habilita a atualizacao "
+            "do pedido) OU nome+cnpj+ie literais (atualiza somente a NF). "
             "Pre-check via API v3 (situacao/chaveAcesso) e pos-check via API v3 (CNPJ efetivo). "
-            "Exige sessao UI ja salva no container; se expirada, retorna erro estruturado."
+            "Exige sessao UI ja salva no container; se expirada, a tool faz auto-login."
         ),
     )
     async def trocar_transportador(
@@ -248,14 +270,49 @@ def register_ui_v0_tools(mcp: FastMCP, get_oauth: callable) -> int:
                 }
             nome_f, cnpj_f, ie_f = nome, cnpj, ie or ""
 
+        # Se a NF veio de um pedido (origem.tipo=venda), atualizar o transportador
+        # no pedido tambem. Feito ANTES da automacao UI da NF porque e API barata
+        # e um erro aqui evita abrir browser. Precisa de idContato — se o chamador
+        # passou nome/cnpj literais, nao da pra derivar o contato, entao pula.
+        id_pedido = None
+        pedido_updated = False
+        origem = nf.get("origem") or {}
+        if origem.get("tipo") == "venda" and origem.get("id"):
+            id_pedido = str(origem["id"])
+        if id_pedido and idContato:
+            try:
+                await _api_put(
+                    oauth,
+                    f"/pedidos/{id_pedido}/despacho",
+                    {"idContatoTransportadora": int(idContato)},
+                )
+                pedido_updated = True
+            except Exception as e:
+                _log("trocar_transportador", idNota, "erro-pedido", started,
+                     {"idPedido": id_pedido, "erro": str(e)})
+                return {
+                    "ok": False,
+                    "motivo": "falha-atualizar-pedido",
+                    "mensagem": (
+                        f"Nao consegui atualizar o transportador no pedido {id_pedido} "
+                        f"(origem da NF). Abortando antes da UI para evitar divergencia."
+                    ),
+                    "erro": str(e),
+                }
+
         try:
             await _do_trocar_transportador(idNota, nome_f, cnpj_f, ie_f)
         except Exception as e:
-            _log("trocar_transportador", idNota, "erro-ui", started, {"erro": str(e)})
+            _log("trocar_transportador", idNota, "erro-ui", started,
+                 {"erro": str(e), "pedido_updated": pedido_updated, "idPedido": id_pedido})
             motivo = "sessao-expirada" if "sessao" in str(e).lower() else "falha-automacao"
-            return {"ok": False, "motivo": motivo, "erro": str(e)}
+            return {"ok": False, "motivo": motivo, "erro": str(e),
+                    "aviso_pedido": (
+                        f"ATENCAO: pedido {id_pedido} ja foi atualizado para o novo transportador, "
+                        f"mas a NF falhou. Estado divergente — reexecutar ou reverter o pedido."
+                    ) if pedido_updated else None}
 
-        # Pos-check
+        # Pos-check NF
         try:
             nf_pos = await _api_get(oauth, f"/notas/{idNota}")
         except Exception as e:
@@ -274,11 +331,15 @@ def register_ui_v0_tools(mcp: FastMCP, get_oauth: callable) -> int:
                 "mensagem": f"CNPJ na NF continua '{got_cnpj}' (esperado '{cnpj_f}').",
             }
 
-        _log("trocar_transportador", idNota, "ok", started, {"cnpj": got_cnpj, "nome": got_nome})
+        _log("trocar_transportador", idNota, "ok", started,
+             {"cnpj": got_cnpj, "nome": got_nome, "pedido_updated": pedido_updated,
+              "idPedido": id_pedido})
         return {
             "ok": True,
             "idNota": idNota,
             "transportador": {"nome": got_nome, "cpfCnpj": got_cnpj, "ie": t.get("ie", "")},
+            "idPedido": id_pedido,
+            "pedidoAtualizado": pedido_updated,
         }
 
     count += 1
