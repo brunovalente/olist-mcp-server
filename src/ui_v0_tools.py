@@ -212,19 +212,25 @@ def register_ui_v0_tools(mcp: FastMCP, get_oauth: callable) -> int:
     @mcp.tool(
         name="trocar_transportador",
         description=(
-            "[UI v0] Altera nome, CPF/CNPJ e IE do transportador de uma nota fiscal NAO autorizada. "
-            "Usa automacao de browser (Playwright) porque a API oficial v2/v3 nao atualiza o CNPJ do "
-            "transportador via PUT /notas/{id}/despacho. "
-            "Se a NF veio de um pedido de venda (nf.origem.tipo=venda) e idContato foi informado, "
-            "tambem atualiza o transportador no pedido via PUT /pedidos/{id}/despacho ANTES da NF, "
-            "para manter pedido e NF alinhados. Se o pedido falhar, aborta sem tocar na NF. Se a NF "
-            "falhar apos o pedido ter sido atualizado, retorna aviso de estado divergente. "
-            "Recusa com erro se a NF ja tiver chaveAcesso (autorizada na SEFAZ). "
-            "Parametros: idNota (obrigatorio). Informe UMA das opcoes de transportador: idContato "
-            "(recomendado; puxa nome/cpfCnpj/inscricaoEstadual do cadastro E habilita a atualizacao "
-            "do pedido) OU nome+cnpj+ie literais (atualiza somente a NF). "
-            "Pre-check via API v3 (situacao/chaveAcesso) e pos-check via API v3 (CNPJ efetivo). "
-            "Exige sessao UI ja salva no container; se expirada, a tool faz auto-login."
+            "[UI v0] Altera o transportador de uma nota fiscal NAO autorizada e, quando a NF veio de "
+            "um pedido de venda, tambem atualiza o transportador do pedido. Caso de uso tipico na "
+            "PANA: operador pede 'trocar transportadora' em um pedido recem-feito — cliente escolheu "
+            "Correios no site, mas o envio vai sair por entrega propria (transportador = PANA TEXTIL, "
+            "idContato=776636263). "
+            "Detalhes do fluxo: (1) pre-check via API v3 recusa NF com chaveAcesso; (2) se "
+            "nf.origem.tipo=venda e idContato informado, chama PUT /pedidos/{id}/despacho com "
+            "idContatoTransportadora (API barata; se falhar aborta antes da UI); (3) automacao "
+            "Playwright na pagina de edicao da NF para alterar nome/CNPJ/IE (necessario porque "
+            "PUT /notas/{id}/despacho da API nao persiste CNPJ); (4) pos-check via API v3. "
+            "GAP CONHECIDO: API v3 nao atualiza formaEnvio/formaFrete do pedido — sao aceitos no "
+            "payload mas ignorados. Se a troca for de Correios para entrega propria, o pedido fica "
+            "com transportador novo e formaEnvio antiga (ex: 'Correios - SEDEX'). A tool retorna "
+            "aviso_forma nesse caso. Nao afeta a etiqueta gerada nem a NF autorizada, apenas a "
+            "visualizacao no ERP. "
+            "Parametros: idNota (obrigatorio). Informe UMA das opcoes: idContato (recomendado — "
+            "puxa dados do cadastro e habilita atualizacao do pedido) OU nome+cnpj+ie literais "
+            "(atualiza somente a NF). "
+            "Se a sessao UI expirou, a tool faz auto-login headless."
         ),
     )
     async def trocar_transportador(
@@ -331,16 +337,24 @@ def register_ui_v0_tools(mcp: FastMCP, get_oauth: callable) -> int:
                 "mensagem": f"CNPJ na NF continua '{got_cnpj}' (esperado '{cnpj_f}').",
             }
 
-        _log("trocar_transportador", idNota, "ok", started,
-             {"cnpj": got_cnpj, "nome": got_nome, "pedido_updated": pedido_updated,
-              "idPedido": id_pedido})
-        return {
+        result = {
             "ok": True,
             "idNota": idNota,
             "transportador": {"nome": got_nome, "cpfCnpj": got_cnpj, "ie": t.get("ie", "")},
             "idPedido": id_pedido,
             "pedidoAtualizado": pedido_updated,
         }
+        if pedido_updated:
+            result["aviso_forma"] = (
+                "pedido.formaEnvio/formaFrete nao sao atualizaveis via API v3 — o contato foi "
+                "trocado mas a forma original pode ter ficado (ex: 'Correios - SEDEX' mesmo com "
+                "transportador novo). Isso nao afeta a etiqueta nem a NF; ajustar manualmente no "
+                "ERP se a visualizacao importar."
+            )
+        _log("trocar_transportador", idNota, "ok", started,
+             {"cnpj": got_cnpj, "nome": got_nome, "pedido_updated": pedido_updated,
+              "idPedido": id_pedido})
+        return result
 
     count += 1
     return count
