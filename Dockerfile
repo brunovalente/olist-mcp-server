@@ -48,6 +48,8 @@ ENV OLIST_UI_BASE_URL="https://erp.olist.com"
 ENV OLIST_UI_SESSION_FILE="/app/data/ui-v0-session.json"
 ENV OLIST_UI_LOG_FILE="/app/data/ui-v0.log"
 ENV OLIST_UI_HEADLESS="true"
+ENV OLIST_UI_USER=""
+ENV OLIST_UI_PASSWORD=""
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD python -c "import httpx; httpx.get('http://localhost:47321/health', timeout=5.0)" || exit 1

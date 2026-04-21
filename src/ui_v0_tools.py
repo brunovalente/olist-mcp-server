@@ -63,25 +63,66 @@ async def _api_get(oauth: OAuthTokenManager, path: str) -> dict:
 
 
 def _get_session_state_path() -> str:
-    p = _env("OLIST_UI_SESSION_FILE", "/app/data/ui-v0-session.json")
-    if not Path(p).exists():
-        raise RuntimeError(
-            f"arquivo de sessao UI ausente em {p}. Renove rodando "
-            "olist_erp_ui_v0_session_init.sh no host (requer ambiente grafico)."
-        )
-    return p
+    return _env("OLIST_UI_SESSION_FILE", "/app/data/ui-v0-session.json")
+
+
+def _do_login_headless() -> str:
+    """Auto-login no Tiny usando OLIST_UI_USER/OLIST_UI_PASSWORD. Retorna path da sessao."""
+    from playwright.sync_api import sync_playwright
+    user = _env("OLIST_UI_USER")
+    password = _env("OLIST_UI_PASSWORD")
+    if not user or not password:
+        raise RuntimeError("OLIST_UI_USER/OLIST_UI_PASSWORD ausentes no ambiente do container")
+    base_url = _env("OLIST_UI_BASE_URL", "https://erp.olist.com").rstrip("/")
+    sess = _get_session_state_path()
+    Path(sess).parent.mkdir(parents=True, exist_ok=True)
+    started = time.time()
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        try:
+            ctx = browser.new_context(viewport={"width": 1920, "height": 1080})
+            page = ctx.new_page()
+            page.goto(base_url, wait_until="networkidle", timeout=30000)
+            page.locator('input[name="username"]').fill(user)
+            page.locator('input[name="password"]').fill(password)
+            try:
+                page.locator('button[type="submit"], input[type="submit"]').first.click()
+            except Exception:
+                page.keyboard.press("Enter")
+            page.wait_for_load_state("networkidle", timeout=30000)
+            url = page.url.lower()
+            if "login" in url or "accounts.tiny.com.br" in url:
+                raise RuntimeError(
+                    "auto-login falhou: continua em pagina de login (credenciais invalidas, captcha ou MFA)"
+                )
+            ctx.storage_state(path=sess)
+        finally:
+            browser.close()
+    try:
+        os.chmod(sess, 0o600)
+    except Exception:
+        pass
+    _log("session-refresh", sess, "ok", started)
+    return sess
+
+
+def _ensure_session() -> str:
+    sess = _get_session_state_path()
+    if not Path(sess).exists():
+        return _do_login_headless()
+    return sess
 
 
 # ---------------------------------------------------------------------------
 # Implementacoes das operacoes
 # ---------------------------------------------------------------------------
 
-def _do_trocar_transportador(id_nota: str, nome: str, cnpj: str, ie: str) -> dict:
+def _do_trocar_transportador(id_nota: str, nome: str, cnpj: str, ie: str, _retry: bool = True) -> dict:
     from playwright.sync_api import sync_playwright
 
     base_url = _env("OLIST_UI_BASE_URL", "https://erp.olist.com").rstrip("/")
     headless = _env("OLIST_UI_HEADLESS", "true").lower() != "false"
-    session_state = _get_session_state_path()
+    session_state = _ensure_session()
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=headless)
@@ -90,7 +131,16 @@ def _do_trocar_transportador(id_nota: str, nome: str, cnpj: str, ie: str) -> dic
         try:
             page.goto(f"{base_url}/notas_fiscais#edit/{id_nota}", wait_until="networkidle")
             if "login" in page.url.lower() or "accounts.tiny.com.br" in page.url.lower():
-                raise RuntimeError("sessao UI expirou — renove via session_init no host")
+                browser.close()
+                if not _retry:
+                    raise RuntimeError("sessao UI expirou mesmo apos auto-login; investigar")
+                # apaga sessao, refaz login, retenta uma vez
+                try:
+                    Path(session_state).unlink()
+                except Exception:
+                    pass
+                _do_login_headless()
+                return _do_trocar_transportador(id_nota, nome, cnpj, ie, _retry=False)
 
             page.wait_for_selector("text=Transportador / Volumes", timeout=30000)
 
