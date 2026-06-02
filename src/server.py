@@ -177,7 +177,7 @@ async def info(request):
         "server": SERVER_NAME,
         "transport": TRANSPORT,
         "tools": tool_count,
-        "ui_v0_tools": ["trocar_transportador"][:ui_v0_count],
+        "ui_v0_tools": ["trocar_transportador", "trocar_transportador_pedido"][:ui_v0_count],
         "swagger_url": SWAGGER_URL,
         "oauth_configured": bool(OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET and AUTH_URL),
     })

@@ -200,6 +200,175 @@ async def _do_trocar_transportador(id_nota: str, nome: str, cnpj: str, ie: str) 
     return {"ok": True}
 
 
+async def _do_trocar_transportador_pedido(
+    id_pedido: str,
+    id_forma_envio: str,
+    id_forma_frete: str,
+    id_transportador: str,
+    nome_transportador: str,
+    frete_por_conta: str,
+) -> dict:
+    """Altera transportador + forma de envio/frete na pagina de edicao do PEDIDO.
+
+    Cobre o gap em que PUT /pedidos/{id}/despacho persiste so idContatoTransportadora
+    (formaEnvio/formaFrete sao ignorados). Aqui a UI toca os selects nativos do form de
+    edicao do pedido (/vendas#edit/<id>) e persiste tudo via salvarVenda().
+    """
+    from playwright.async_api import async_playwright
+
+    base_url = _env("OLIST_UI_BASE_URL", "https://erp.olist.com").rstrip("/")
+    headless = _env("OLIST_UI_HEADLESS", "true").lower() != "false"
+    sess = _get_session_state_path()
+    has_session = Path(sess).exists()
+    pedido_url = f"{base_url}/vendas#edit/{id_pedido}"
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=headless)
+        ctx_kwargs = {"viewport": {"width": 1920, "height": 1080}}
+        if has_session:
+            ctx_kwargs["storage_state"] = sess
+        ctx = await browser.new_context(**ctx_kwargs)
+        page = await ctx.new_page()
+        try:
+            await page.goto(pedido_url, wait_until="domcontentloaded")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=20000)
+            except Exception:
+                pass
+
+            # Login inline se aparecer o form (mesmo contexto — nao reabrir o browser,
+            # senao o Olist invalida a sessao por detecao de novo dispositivo).
+            if await page.locator('input[name="username"]').count() > 0:
+                started_login = time.time()
+                await _login_on_page(page)
+                Path(sess).parent.mkdir(parents=True, exist_ok=True)
+                await ctx.storage_state(path=sess)
+                try:
+                    os.chmod(sess, 0o600)
+                except Exception:
+                    pass
+                _log("session-refresh", sess, "ok", started_login)
+                await page.goto(pedido_url, wait_until="domcontentloaded")
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=20000)
+                except Exception:
+                    pass
+
+            # Modal "ja esta logado em outro dispositivo" — assumir a sessao.
+            try:
+                await page.wait_for_selector(
+                    "text=já está logado em outro dispositivo", timeout=5000
+                )
+                await page.get_by_role("button", name="login", exact=False).first.click()
+                await page.wait_for_load_state("networkidle", timeout=20000)
+            except Exception:
+                pass
+
+            if "vendas" not in page.url:
+                raise RuntimeError(
+                    f"nao consegui navegar para pedido {id_pedido} (url={page.url})"
+                )
+
+            # Entra em modo edicao (botao "editar" na visualizacao do pedido).
+            edit_btn = page.locator('button:has-text("editar")').first
+            if await edit_btn.count() == 0:
+                raise RuntimeError("botao 'editar' nao encontrado na visualizacao do pedido")
+            await edit_btn.click()
+            await page.wait_for_selector("select#idFormaEnvio", timeout=20000)
+
+            # Pre-check via UI: pedido com expedicao criada bloqueia alteracao de transporte.
+            aviso = page.locator("#divMsgVendaEdicaoDadosExpedicao").first
+            try:
+                if await aviso.count() > 0 and await aviso.is_visible():
+                    raise RuntimeError(
+                        "pedido tem expedicao criada — UI bloqueia alteracao de transporte. "
+                        "Cancelar a expedicao no Olist antes."
+                    )
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+
+            # 1) Forma de envio (select nativo). onChangeIdFormaEnvio repopula #idFormaFrete.
+            await page.select_option("select#idFormaEnvio", value=str(id_forma_envio))
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+
+            # 2) Forma de frete (espera o option async carregar).
+            if id_forma_frete:
+                deadline = time.time() + 10
+                ok = False
+                while time.time() < deadline:
+                    has = await page.evaluate(
+                        "(v) => !!document.querySelector(`select#idFormaFrete option[value='${v}']`)",
+                        str(id_forma_frete),
+                    )
+                    if has:
+                        ok = True
+                        break
+                    await page.wait_for_timeout(500)
+                if not ok:
+                    opts = await page.evaluate(
+                        "() => Array.from(document.querySelectorAll('select#idFormaFrete option'))"
+                        ".map(o => ({v:o.value, t:o.text}))"
+                    )
+                    raise RuntimeError(
+                        f"forma de frete {id_forma_frete} nao disponivel para "
+                        f"forma_envio={id_forma_envio}. Opcoes: {opts}"
+                    )
+                await page.select_option("select#idFormaFrete", value=str(id_forma_frete))
+
+            # 3) Transportador (hidden id + texto visivel) via proto setter — bypassa autocomplete.
+            set_js = """
+            (args) => {
+              const [name, value] = args;
+              const el = document.querySelector('input[name="' + name + '"]');
+              if (!el) return {ok:false, reason:'input nao encontrado: '+name};
+              const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+              proto.set.call(el, value);
+              el.dispatchEvent(new Event('input',  {bubbles:true}));
+              el.dispatchEvent(new Event('change', {bubbles:true}));
+              el.dispatchEvent(new Event('blur',   {bubbles:true}));
+              return {ok:true, current: el.value};
+            }
+            """
+            for field, value in [
+                ("idTransportador", str(id_transportador)),
+                ("transportador", nome_transportador),
+            ]:
+                r = await page.evaluate(set_js, [field, value])
+                if not r.get("ok"):
+                    raise RuntimeError(f"falha ao setar {field}: {r}")
+
+            # 4) Frete por conta (opcional).
+            if frete_por_conta:
+                await page.select_option("select#fretePorConta", value=str(frete_por_conta))
+
+            # 5) Salvar. Tiny expoe salvarVenda() global; fallback pro botao.
+            saved = await page.evaluate(
+                "() => { if (typeof salvarVenda === 'function') { salvarVenda(); return {ok:true}; } return {ok:false}; }"
+            )
+            if not saved.get("ok"):
+                btn = page.locator('button:has-text("salvar")').first
+                if await btn.count() == 0:
+                    raise RuntimeError("nao consegui salvar: nem salvarVenda() nem botao 'salvar'")
+                await btn.click()
+            await page.wait_for_load_state("networkidle", timeout=30000)
+
+            # Persiste sessao (cookies podem ter rotacionado).
+            try:
+                await ctx.storage_state(path=sess)
+                os.chmod(sess, 0o600)
+            except Exception:
+                pass
+        finally:
+            await browser.close()
+
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------------------
 # Registro das tools UI v0 no MCP
 # ---------------------------------------------------------------------------
@@ -354,6 +523,135 @@ def register_ui_v0_tools(mcp: FastMCP, get_oauth: callable) -> int:
         _log("trocar_transportador", idNota, "ok", started,
              {"cnpj": got_cnpj, "nome": got_nome, "pedido_updated": pedido_updated,
               "idPedido": id_pedido})
+        return result
+
+    count += 1
+
+    @mcp.tool(
+        name="trocar_transportador_pedido",
+        description=(
+            "[UI v0] Altera o transportador E a forma de envio/frete de um PEDIDO de venda. "
+            "Use quando o pedido ainda NAO tem NF, ou quando so quer ajustar o transporte do pedido. "
+            "Diferente de trocar_transportador (que opera numa NF por idNota), aqui o alvo e o pedido. "
+            "Cobre o gap em que PUT /pedidos/{id}/despacho persiste so o contato do transportador e "
+            "IGNORA formaEnvio/formaFrete — esta tool toca os selects nativos da pagina de edicao do "
+            "pedido (Playwright) e persiste tudo via salvarVenda(). "
+            "Caso de uso PANA: pedido recem-criado em que o cliente escolheu 'Correios' no site mas o "
+            "envio vai sair por SEDEX/PAC especifico ou entrega propria — passe o transportador e as "
+            "formas corretas. "
+            "Fluxo: (1) resolve idPedido (por numero, se preciso) e o nome do transportador via API v3; "
+            "(2) Playwright: entra em edicao, seta forma de envio (que repopula as formas de frete), "
+            "forma de frete, transportador (id+nome) e frete por conta; salva; (3) pos-check via API v3 "
+            "(endpoint de lista) confirma transportador + forma de envio. "
+            "Recusa se o pedido ja tem expedicao criada (a UI bloqueia). Se a sessao UI expirou, faz "
+            "auto-login headless. "
+            "Parametros: informe idPedido OU numero (um dos dois); idContato = id do contato do "
+            "transportador (ex Correios=579759491, PANA TEXTIL=776636263); idFormaEnvio (obrigatorio); "
+            "idFormaFrete (opcional); fretePorConta (opcional: R=remetente, D=destinatario, "
+            "T=terceiros, S=sem frete)."
+        ),
+    )
+    async def trocar_transportador_pedido(
+        idContato: str,
+        idFormaEnvio: str,
+        idPedido: str | None = None,
+        numero: str | None = None,
+        idFormaFrete: str | None = None,
+        fretePorConta: str | None = None,
+    ) -> dict:
+        started = time.time()
+        if not idPedido and not numero:
+            return {
+                "ok": False,
+                "motivo": "parametros-insuficientes",
+                "mensagem": "Informe idPedido OU numero do pedido.",
+            }
+
+        oauth = get_oauth()
+
+        # Resolve idPedido (por numero, se preciso) e captura o numeroPedido p/ o pos-check.
+        try:
+            if not idPedido:
+                lst = await _api_get(oauth, f"/pedidos?numero={numero}")
+                itens = lst.get("itens") or []
+                if not itens:
+                    return {
+                        "ok": False,
+                        "motivo": "pedido-nao-encontrado",
+                        "mensagem": f"Nenhum pedido com numero {numero}.",
+                    }
+                idPedido = str(itens[0].get("id"))
+            pedido = await _api_get(oauth, f"/pedidos/{idPedido}")
+            numero_pedido = str(pedido.get("numeroPedido") or numero or "")
+        except Exception as e:
+            _log("trocar_transportador_pedido", str(idPedido or numero), "erro-precheck", started, {"erro": str(e)})
+            return {"ok": False, "motivo": "precheck-api-falhou", "erro": str(e)}
+
+        # Resolve o nome do transportador a partir do contato.
+        try:
+            contato = await _api_get(oauth, f"/contatos/{idContato}")
+        except Exception as e:
+            _log("trocar_transportador_pedido", str(idPedido), "erro-contato", started, {"erro": str(e)})
+            return {"ok": False, "motivo": "contato-nao-encontrado", "erro": str(e)}
+        nome_t = contato.get("nome", "") or ""
+
+        # Automacao UI.
+        try:
+            await _do_trocar_transportador_pedido(
+                str(idPedido),
+                str(idFormaEnvio),
+                str(idFormaFrete or ""),
+                str(idContato),
+                nome_t,
+                str(fretePorConta or ""),
+            )
+        except Exception as e:
+            msg = str(e).lower()
+            motivo = "falha-automacao"
+            if "expedicao" in msg:
+                motivo = "expedicao-criada"
+            elif "login" in msg or "sessao" in msg:
+                motivo = "sessao-expirada"
+            _log("trocar_transportador_pedido", str(idPedido), "erro-ui", started, {"erro": str(e)})
+            return {"ok": False, "motivo": motivo, "erro": str(e)}
+
+        # Pos-check via endpoint de LISTA (o obter /pedidos/{id} nao retorna transportador).
+        try:
+            lst_pos = await _api_get(oauth, f"/pedidos?numero={numero_pedido}")
+            itens_pos = lst_pos.get("itens") or []
+            pos = itens_pos[0] if itens_pos else {}
+        except Exception as e:
+            _log("trocar_transportador_pedido", str(idPedido), "erro-poscheck", started, {"erro": str(e)})
+            return {"ok": False, "motivo": "poscheck-api-falhou", "erro": str(e)}
+
+        t = pos.get("transportador") or {}
+        got_tid = str(t.get("id") or "")
+        got_fe = str((t.get("formaEnvio") or {}).get("id") or "")
+        if got_tid != str(idContato) or (idFormaEnvio and got_fe != str(idFormaEnvio)):
+            _log("trocar_transportador_pedido", str(idPedido), "poscheck-fail", started,
+                 {"esperado_tid": idContato, "obtido_tid": got_tid,
+                  "esperado_fe": idFormaEnvio, "obtido_fe": got_fe})
+            return {
+                "ok": False,
+                "motivo": "poscheck-divergente",
+                "mensagem": (
+                    f"Pos-check divergente no pedido {numero_pedido}: "
+                    f"transportador={got_tid} (esperado {idContato}), "
+                    f"formaEnvio={got_fe} (esperado {idFormaEnvio})."
+                ),
+            }
+
+        result = {
+            "ok": True,
+            "idPedido": idPedido,
+            "numeroPedido": numero_pedido,
+            "transportador": {"id": got_tid, "nome": t.get("nome", "")},
+            "formaEnvio": t.get("formaEnvio") or {},
+            "formaFrete": t.get("formaFrete") or {},
+            "fretePorConta": t.get("fretePorConta", ""),
+        }
+        _log("trocar_transportador_pedido", str(idPedido), "ok", started,
+             {"tid": got_tid, "fe": got_fe, "numero": numero_pedido})
         return result
 
     count += 1
