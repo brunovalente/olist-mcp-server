@@ -145,7 +145,7 @@ async def _do_trocar_transportador(id_nota: str, nome: str, cnpj: str, ie: str) 
                 Path(sess).parent.mkdir(parents=True, exist_ok=True)
                 await ctx.storage_state(path=sess)
                 try:
-                    os.chmod(sess, 0o600)
+                    os.chmod(sess, 0o660)  # 0o660 (nao 0o600): preserva o mask da ACL no mount compartilhado; container uid 1002=pana_agent precisa rw
                 except Exception:
                     pass
                 _log("session-refresh", sess, "ok", started_login)
@@ -244,7 +244,7 @@ async def _do_trocar_transportador_pedido(
                 Path(sess).parent.mkdir(parents=True, exist_ok=True)
                 await ctx.storage_state(path=sess)
                 try:
-                    os.chmod(sess, 0o600)
+                    os.chmod(sess, 0o660)  # 0o660 (nao 0o600): preserva o mask da ACL no mount compartilhado; container uid 1002=pana_agent precisa rw
                 except Exception:
                     pass
                 _log("session-refresh", sess, "ok", started_login)
@@ -360,7 +360,7 @@ async def _do_trocar_transportador_pedido(
             # Persiste sessao (cookies podem ter rotacionado).
             try:
                 await ctx.storage_state(path=sess)
-                os.chmod(sess, 0o600)
+                os.chmod(sess, 0o660)  # 0o660 (nao 0o600): preserva o mask da ACL no mount compartilhado; container uid 1002=pana_agent precisa rw
             except Exception:
                 pass
         finally:
