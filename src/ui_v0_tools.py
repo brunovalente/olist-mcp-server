@@ -261,6 +261,13 @@ async def _do_trocar_transportador_pedido(
                         await page.goto(pedido_url, wait_until="domcontentloaded")
                     await wait_quiet()
 
+                    modal = page.locator("#bs-modal-ui-popup").first
+                    if await modal.count() > 0:
+                        btn = modal.locator('button.btn-primary:has-text("login")').first
+                        if await btn.count() > 0:
+                            await btn.click()
+                            await wait_quiet()
+
                     if await page.locator('input[name="username"]').count() > 0:
                         return False
                     if "vendas" in page.url:
