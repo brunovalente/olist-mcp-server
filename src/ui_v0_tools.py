@@ -221,6 +221,7 @@ async def _do_trocar_transportador_pedido(
     sess = _get_session_state_path()
     has_session = Path(sess).exists()
     pedido_url = f"{base_url}/vendas#edit/{id_pedido}"
+    vendas_url = f"{base_url}/vendas"
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless)
@@ -230,11 +231,51 @@ async def _do_trocar_transportador_pedido(
         ctx = await browser.new_context(**ctx_kwargs)
         page = await ctx.new_page()
         try:
-            await page.goto(pedido_url, wait_until="domcontentloaded")
-            try:
-                await page.wait_for_load_state("networkidle", timeout=20000)
-            except Exception:
-                pass
+            async def wait_quiet(timeout: int = 20000) -> None:
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=timeout)
+                except Exception:
+                    pass
+
+            async def ensure_pedido_route() -> bool:
+                """Abre o pedido mesmo quando o SSO aterrissa na home autenticada.
+
+                O Olist/Tiny as vezes aceita a sessao mas ignora a primeira URL com hash,
+                deixando o browser em https://erp.olist.com/. Nessa situacao, navegar para
+                /vendas e disparar o hash do SPA replica o fluxo que funciona no browser.
+                """
+                for attempt in range(3):
+                    if attempt == 0:
+                        await page.goto(pedido_url, wait_until="domcontentloaded")
+                    elif attempt == 1:
+                        await page.goto(vendas_url, wait_until="domcontentloaded")
+                        await wait_quiet()
+                        await page.evaluate(
+                            """(id) => {
+                              window.location.hash = `#edit/${id}`;
+                              window.dispatchEvent(new HashChangeEvent('hashchange'));
+                            }""",
+                            str(id_pedido),
+                        )
+                    else:
+                        await page.goto(pedido_url, wait_until="domcontentloaded")
+                    await wait_quiet()
+
+                    if await page.locator('input[name="username"]').count() > 0:
+                        return False
+                    if "vendas" in page.url:
+                        return True
+                    try:
+                        await page.wait_for_selector(
+                            'button:has-text("editar"), select#idFormaEnvio',
+                            timeout=5000,
+                        )
+                        return True
+                    except Exception:
+                        pass
+                return "vendas" in page.url
+
+            await ensure_pedido_route()
 
             # Login inline se aparecer o form (mesmo contexto — nao reabrir o browser,
             # senao o Olist invalida a sessao por detecao de novo dispositivo).
@@ -248,11 +289,7 @@ async def _do_trocar_transportador_pedido(
                 except Exception:
                     pass
                 _log("session-refresh", sess, "ok", started_login)
-                await page.goto(pedido_url, wait_until="domcontentloaded")
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=20000)
-                except Exception:
-                    pass
+                await ensure_pedido_route()
 
             # Modal "ja esta logado em outro dispositivo" — assumir a sessao.
             try:
@@ -260,7 +297,8 @@ async def _do_trocar_transportador_pedido(
                     "text=já está logado em outro dispositivo", timeout=5000
                 )
                 await page.get_by_role("button", name="login", exact=False).first.click()
-                await page.wait_for_load_state("networkidle", timeout=20000)
+                await wait_quiet()
+                await ensure_pedido_route()
             except Exception:
                 pass
 
