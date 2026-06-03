@@ -275,6 +275,26 @@ async def _do_trocar_transportador_pedido(
                         pass
                 return "vendas" in page.url
 
+            async def handle_kick_modal() -> bool:
+                """Assume a sessao quando o Olist bloqueia por login em outro dispositivo."""
+                try:
+                    body = await page.locator("body").inner_text(timeout=3000)
+                except Exception:
+                    body = ""
+                if "logado em outro dispositivo" not in body:
+                    return False
+
+                btn = page.locator('#bs-modal-ui-popup button.btn-primary:has-text("login")').first
+                if await btn.count() == 0:
+                    btn = page.locator('button:has-text("login")').first
+                if await btn.count() == 0:
+                    raise RuntimeError(
+                        "modal de sessao concorrente apareceu, mas o botao 'login' nao foi encontrado"
+                    )
+                await btn.click()
+                await wait_quiet()
+                return True
+
             await ensure_pedido_route()
 
             # Login inline se aparecer o form (mesmo contexto — nao reabrir o browser,
@@ -292,15 +312,8 @@ async def _do_trocar_transportador_pedido(
                 await ensure_pedido_route()
 
             # Modal "ja esta logado em outro dispositivo" — assumir a sessao.
-            try:
-                await page.wait_for_selector(
-                    "text=já está logado em outro dispositivo", timeout=5000
-                )
-                await page.get_by_role("button", name="login", exact=False).first.click()
-                await wait_quiet()
+            if await handle_kick_modal():
                 await ensure_pedido_route()
-            except Exception:
-                pass
 
             if "vendas" not in page.url:
                 raise RuntimeError(
