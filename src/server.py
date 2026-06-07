@@ -13,6 +13,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from src.etiqueta_tools import register_etiqueta_tools
 from src.oauth import AUTH_URL, OAuthTokenManager
 from src.token_auth import get_token_manager as get_api_token_manager
 from src.tools_generator import register_tools
@@ -69,6 +70,10 @@ print(f"Registered {tool_count} tools")
 # UI v0 tools (Playwright) — gaps nao cobertos pela API oficial
 ui_v0_count = register_ui_v0_tools(mcp, get_token_manager)
 print(f"Registered {ui_v0_count} UI v0 tools")
+
+# Etiqueta tools — gera ZPL + publica no oneOS `temp` via HTTP
+etiqueta_count = register_etiqueta_tools(mcp, get_token_manager)
+print(f"Registered {etiqueta_count} etiqueta tools")
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +183,7 @@ async def info(request):
         "transport": TRANSPORT,
         "tools": tool_count,
         "ui_v0_tools": ["trocar_transportador", "trocar_transportador_pedido"][:ui_v0_count],
+        "etiqueta_tools": ["gerar_etiqueta_envio"][:etiqueta_count],
         "swagger_url": SWAGGER_URL,
         "oauth_configured": bool(OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET and AUTH_URL),
     })

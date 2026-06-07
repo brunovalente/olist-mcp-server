@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY swagger.json .
 COPY src/ ./src/
+COPY templates/ ./templates/
 RUN mkdir -p /app/data
 
 EXPOSE 47321
@@ -55,6 +56,11 @@ ENV OLIST_UI_LOG_FILE="/app/data/ui-v0.log"
 ENV OLIST_UI_HEADLESS="true"
 ENV OLIST_UI_USER=""
 ENV OLIST_UI_PASSWORD=""
+
+# Etiqueta tools — publica via daemon HTTP do servico oneOS `temp`
+ENV TEMP_PUBLISH_URL="https://temp.pana.oneos.work/etiquetas/publish"
+ENV TEMP_PUBLISH_TOKEN=""
+ENV ONEOS_TZ="America/Fortaleza"
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD python -c "import httpx; httpx.get('http://localhost:47321/health', timeout=5.0)" || exit 1
