@@ -2,6 +2,9 @@
 
 Escopo desta rev:
 - trocar_transportador: altera nome/CNPJ/IE do transportador de uma NF nao autorizada.
+- trocar_transportador_pedido: altera transportador + forma envio/frete no pedido.
+- criar_nota_devolucao: cria devolucao de venda via form Olist (gap da API v3).
+- gerar_nf_devolucao: gera NF de entrada (devolucao) a partir da devolucao criada.
 
 Convencoes:
 - Toda tool v0 faz pre-check via API oficial antes de abrir browser (recusa se ja autorizada).
@@ -428,6 +431,338 @@ async def _do_trocar_transportador_pedido(
 
 
 # ---------------------------------------------------------------------------
+# _do_nota_devolucao
+# ---------------------------------------------------------------------------
+
+async def _do_nota_devolucao(
+    id_nota: str,
+    data_devolucao_ui: str,
+    id_forma_pag: str,
+    id_forma_envio: str,
+    observacoes: str,
+) -> dict:
+    """Cria devolucao de venda a partir de NF-e autorizada de saida via UI do Olist.
+
+    Navega: notas_fiscais#edit/{idNota} -> mais acoes -> devolver produtos
+    -> devolucoes_vendas#add/2/{idNota} -> preenche campos -> salvar.
+    """
+    from playwright.async_api import async_playwright
+
+    base_url = _env("OLIST_UI_BASE_URL", "https://erp.olist.com").rstrip("/")
+    headless = _env("OLIST_UI_HEADLESS", "true").lower() != "false"
+    sess = _get_session_state_path()
+    has_session = Path(sess).exists()
+    nf_url = f"{base_url}/notas_fiscais#edit/{id_nota}"
+
+    async def _wait_quiet(page, timeout: int = 20000) -> None:
+        try:
+            await page.wait_for_load_state("networkidle", timeout=timeout)
+        except Exception:
+            pass
+
+    async def _handle_kick(page) -> bool:
+        try:
+            body = await page.locator("body").inner_text(timeout=3000)
+        except Exception:
+            body = ""
+        if "logado em outro dispositivo" not in body.lower():
+            return False
+        btn = page.locator("button:has-text('login'), a:has-text('login')").first
+        if await btn.count() > 0:
+            await btn.click()
+            await _wait_quiet(page)
+            return True
+        return False
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=headless)
+        ctx_kwargs = {"viewport": {"width": 1920, "height": 1080}}
+        if has_session:
+            ctx_kwargs["storage_state"] = sess
+        ctx = await browser.new_context(**ctx_kwargs)
+        page = await ctx.new_page()
+        try:
+            # Navega pra raiz primeiro para disparar kick modal antes de tentar a rota alvo.
+            await page.goto(base_url, wait_until="domcontentloaded")
+            await _wait_quiet(page)
+            await _handle_kick(page)
+
+            # Login inline se necessario (nao fechar o browser).
+            if await page.locator('input[name="username"]').count() > 0:
+                started_login = time.time()
+                await _login_on_page(page)
+                Path(sess).parent.mkdir(parents=True, exist_ok=True)
+                await ctx.storage_state(path=sess)
+                try:
+                    import os as _os; _os.chmod(sess, 0o660)
+                except Exception:
+                    pass
+                _log("session-refresh", sess, "ok", started_login)
+
+            # Navega para NF com retry (SPA pode interromper o goto com redirect).
+            for attempt in range(4):
+                try:
+                    await page.goto(nf_url, wait_until="networkidle", timeout=30000)
+                except Exception:
+                    pass
+                await _wait_quiet(page)
+                await _handle_kick(page)
+                if "notas_fiscais" in page.url:
+                    break
+
+            if "notas_fiscais" not in page.url:
+                raise RuntimeError(f"nao consegui navegar para NF {id_nota} (url={page.url})")
+
+            # Click "mais acoes"
+            mais = page.locator("text=mais ações").first
+            await mais.wait_for(timeout=15000)
+            await mais.click()
+            await page.wait_for_timeout(1500)
+
+            # Click "devolver produtos"
+            devol_link = page.locator(".dropdown-menu a:has-text('devolver')").first
+            if await devol_link.count() == 0 or not await devol_link.is_visible():
+                raise RuntimeError("opcao 'devolver produtos' ausente no menu — NF pode nao ser do tipo Saida/Autorizada")
+            await devol_link.click()
+
+            # Aguarda o form de devolucao carregar
+            await page.wait_for_selector("#dataDevolucaoDevolucao", timeout=20000)
+            await page.wait_for_timeout(2000)
+            await _handle_kick(page)
+
+            # Preenche data
+            data_field = page.locator("#dataDevolucaoDevolucao")
+            await data_field.click()
+            await data_field.fill(data_devolucao_ui)
+            await data_field.press("Tab")
+            await page.wait_for_timeout(500)
+
+            # Forma de pagamento
+            await page.select_option("#idFormaPagamentoDevolucao", value=id_forma_pag)
+            await page.wait_for_timeout(500)
+
+            # Forma de envio (logistica reversa) — opcional
+            if id_forma_envio != "0":
+                try:
+                    await page.select_option("#idFormaEnvioDevolucao", value=id_forma_envio)
+                    await page.wait_for_timeout(500)
+                except Exception:
+                    pass
+
+            # Observacoes
+            if observacoes:
+                await page.locator("#observacoesInternas").fill(observacoes)
+
+            # Salvar
+            salvar = page.locator("button:has-text('salvar')").first
+            await salvar.wait_for(timeout=10000)
+            await salvar.click()
+            await _wait_quiet(page, 30000)
+            await page.wait_for_timeout(2000)
+
+            url_final = page.url
+
+            # Persiste sessao
+            try:
+                await ctx.storage_state(path=sess)
+                import os as _os; _os.chmod(sess, 0o660)
+            except Exception:
+                pass
+        finally:
+            await browser.close()
+
+    return {"ok": True, "url_form": url_final}
+
+
+# ---------------------------------------------------------------------------
+# _do_gerar_nf_devolucao
+# ---------------------------------------------------------------------------
+
+async def _do_gerar_nf_devolucao(id_nota_original: str) -> dict:
+    """Gera NF de devolucao (Nota de Entrada) a partir de uma devolucao existente.
+
+    Navega pra lista devolucoes_vendas, encontra a linha cuja coluna [N] aponta para
+    id_nota_original, clica no botao '...' e dispara JS click em 'gerar nota de
+    devolucao' (li#im_9 — href=javascript:void(0), handler via event listener).
+    Aguarda ~12s pra lista atualizar e extrai o idNota da coluna [D] resultante.
+    """
+    from playwright.async_api import async_playwright
+    import re as _re
+
+    base_url = _env("OLIST_UI_BASE_URL", "https://erp.olist.com").rstrip("/")
+    headless = _env("OLIST_UI_HEADLESS", "true").lower() != "false"
+    sess = _get_session_state_path()
+    has_session = Path(sess).exists()
+    devol_list_url = f"{base_url}/devolucoes_vendas#list"
+    nf_suffix = f"notas_fiscais#edit/{id_nota_original}"
+
+    async def _wait_quiet(page, timeout: int = 20000) -> None:
+        try:
+            await page.wait_for_load_state("networkidle", timeout=timeout)
+        except Exception:
+            pass
+
+    async def _handle_kick(page) -> bool:
+        try:
+            body = await page.locator("body").inner_text(timeout=3000)
+        except Exception:
+            body = ""
+        if "logado em outro dispositivo" not in body.lower():
+            return False
+        btn = page.locator("button:has-text('login'), a:has-text('login')").first
+        if await btn.count() > 0:
+            await btn.click()
+            await _wait_quiet(page)
+            return True
+        return False
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=headless)
+        ctx_kwargs = {"viewport": {"width": 1920, "height": 1080}}
+        if has_session:
+            ctx_kwargs["storage_state"] = sess
+        ctx = await browser.new_context(**ctx_kwargs)
+        page = await ctx.new_page()
+        try:
+            # Raiz pra kick modal
+            await page.goto(base_url, wait_until="domcontentloaded")
+            await _wait_quiet(page)
+            await _handle_kick(page)
+
+            if await page.locator('input[name="username"]').count() > 0:
+                started_login = time.time()
+                await _login_on_page(page)
+                Path(sess).parent.mkdir(parents=True, exist_ok=True)
+                await ctx.storage_state(path=sess)
+                try:
+                    import os as _os; _os.chmod(sess, 0o660)
+                except Exception:
+                    pass
+                _log("session-refresh", sess, "ok", started_login)
+
+            # Navega pra lista de devolucoes
+            for attempt in range(4):
+                try:
+                    await page.goto(devol_list_url, wait_until="networkidle", timeout=30000)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(4000)
+                await _handle_kick(page)
+                if "devolucoes_vendas" in page.url:
+                    break
+
+            if "devolucoes_vendas" not in page.url:
+                raise RuntimeError(f"nao consegui navegar para lista de devolucoes (url={page.url})")
+
+            # Encontra a linha com [N] -> id_nota_original
+            rows = page.locator("table tbody tr")
+            row_count = await rows.count()
+            target_row = None
+            for i in range(row_count):
+                row = rows.nth(i)
+                links_info = await row.evaluate("""(row) => {
+                    var links = row.querySelectorAll('a');
+                    var data = [];
+                    links.forEach(function(a) { data.push({href: a.href, text: a.innerText.trim()}); });
+                    return data;
+                }""")
+                for link in links_info:
+                    href = link.get("href", "")
+                    if f"notas_fiscais#edit/{id_nota_original}" in href:
+                        # Verifica se ainda nao tem D (NF de devolucao)
+                        has_d = any("notas_entrada#edit" in l.get("href", "") for l in links_info)
+                        if has_d:
+                            # Ja tem NF — extrai e retorna
+                            for l in links_info:
+                                m = _re.search(r"notas_entrada#edit/(\d+)", l.get("href", ""))
+                                if m:
+                                    await browser.close()
+                                    return {"ok": True, "id_nf_devolucao": m.group(1), "ja_existia": True}
+                        target_row = row
+                        break
+                if target_row is not None:
+                    break
+
+            if target_row is None:
+                raise RuntimeError(
+                    f"nao encontrei devolucao com NF original {id_nota_original} na lista. "
+                    "Verifique se a devolucao foi criada com criar_nota_devolucao."
+                )
+
+            # Clica no botao '...' (button.button-navigate) da linha
+            menu_btn = target_row.locator("button.button-navigate").first
+            await menu_btn.click()
+            await page.wait_for_timeout(1500)
+
+            # JS click em 'gerar nota de devolucao' — o handler e via event listener, nao onclick
+            result = await page.evaluate("""() => {
+                var items = document.querySelectorAll('li, a, button');
+                for (var i = 0; i < items.length; i++) {
+                    var txt = items[i].innerText.trim().toLowerCase();
+                    if (txt.indexOf('gerar nota') >= 0) {
+                        items[i].click();
+                        return {found: true, text: items[i].innerText.trim()};
+                    }
+                }
+                return {found: false};
+            }""")
+
+            if not result.get("found"):
+                raise RuntimeError(
+                    "opcao 'gerar nota de devolucao' nao encontrada no popup. "
+                    "Verifique se a devolucao esta em status 'em aberto'."
+                )
+
+            # Aguarda a lista atualizar (operacao assincrona no servidor)
+            await page.wait_for_timeout(12000)
+
+            # Recarrega a lista para pegar o link D atualizado
+            try:
+                await page.goto(devol_list_url, wait_until="networkidle", timeout=30000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(4000)
+
+            # Procura o link D na linha com N = id_nota_original
+            rows2 = page.locator("table tbody tr")
+            row_count2 = await rows2.count()
+            id_nf_devol = None
+            for i in range(row_count2):
+                row = rows2.nth(i)
+                links_info = await row.evaluate("""(row) => {
+                    var links = row.querySelectorAll('a');
+                    var data = [];
+                    links.forEach(function(a) { data.push({href: a.href}); });
+                    return data;
+                }""")
+                has_n = any(f"notas_fiscais#edit/{id_nota_original}" in l.get("href", "") for l in links_info)
+                if has_n:
+                    for l in links_info:
+                        m = _re.search(r"notas_entrada#edit/(\d+)", l.get("href", ""))
+                        if m:
+                            id_nf_devol = m.group(1)
+                            break
+                    break
+
+            # Persiste sessao
+            try:
+                await ctx.storage_state(path=sess)
+                import os as _os; _os.chmod(sess, 0o660)
+            except Exception:
+                pass
+        finally:
+            await browser.close()
+
+    if not id_nf_devol:
+        raise RuntimeError(
+            f"NF de devolucao nao apareceu na lista apos gerar (NF original={id_nota_original}). "
+            "A operacao pode ter falhado ou o servidor demorou mais que 12s."
+        )
+
+    return {"ok": True, "id_nf_devolucao": id_nf_devol}
+
+
+# ---------------------------------------------------------------------------
 # Registro das tools UI v0 no MCP
 # ---------------------------------------------------------------------------
 
@@ -711,6 +1046,127 @@ def register_ui_v0_tools(mcp: FastMCP, get_oauth: callable) -> int:
         _log("trocar_transportador_pedido", str(idPedido), "ok", started,
              {"tid": got_tid, "fe": got_fe, "numero": numero_pedido})
         return result
+
+    count += 1
+
+    @mcp.tool(
+        name="criar_nota_devolucao",
+        description=(
+            "[UI v0] Cria uma devolucao de venda a partir de uma NF-e de saida Autorizada. "
+            "Preenche o form de devolucao no Olist (data, forma de pagamento, logistica reversa, "
+            "observacoes) e salva. Apos criar, use gerar_nf_devolucao para emitir a NF de entrada "
+            "e autorizar_nota_fiscal para autorizar na SEFAZ. "
+            "Pre-requisitos: NF do tipo Saida, situacao=6 (Autorizada). Nao pode existir devolucao "
+            "ja criada para esta NF. "
+            "formaPagamento: sem_pagamento | contas_a_pagar | dinheiro | estornar (default, "
+            "estorna da venda/nota) | vale_troca. "
+            "formaEnvio: nao_definida (default) | correios_pac | correios_sedex."
+        ),
+    )
+    async def criar_nota_devolucao(
+        idNota: str,
+        dataDevoluacao: str = "",
+        formaPagamento: str = "estornar",
+        formaEnvio: str = "nao_definida",
+        observacoes: str = "",
+    ) -> dict:
+        started = time.time()
+
+        # Pre-check: NF deve ser Saida e Autorizada
+        oauth = get_oauth()
+        try:
+            nf = await _api_get(oauth, f"/notas/{idNota}")
+        except Exception as e:
+            _log("criar_nota_devolucao", idNota, "erro-precheck", started, {"erro": str(e)})
+            return {"ok": False, "motivo": "precheck-api-falhou", "erro": str(e)}
+
+        tipo = nf.get("tipo", "")
+        situacao = str(nf.get("situacao", ""))
+        if tipo != "S":
+            return {"ok": False, "motivo": "nf-nao-e-saida",
+                    "mensagem": f"NF {idNota} e do tipo '{tipo}', esperado 'S' (Saida)."}
+        if situacao != "6":
+            return {"ok": False, "motivo": "nf-nao-autorizada",
+                    "mensagem": f"NF {idNota} situacao={situacao}, esperado 6 (Autorizada)."}
+
+        # Mapeia forma de pagamento -> id do select
+        forma_pag_map = {
+            "sem_pagamento": "0", "contas_a_pagar": "1",
+            "dinheiro": "2", "estornar": "3", "vale_troca": "4",
+        }
+        id_forma_pag = forma_pag_map.get(formaPagamento, "3")
+
+        # Mapeia forma de envio -> id do select
+        forma_envio_map = {
+            "nao_definida": "0", "correios_pac": "577006674", "correios_sedex": "579516750",
+        }
+        id_forma_envio = forma_envio_map.get(formaEnvio, "0")
+
+        # Converte data YYYY-MM-DD -> DD/MM/YYYY
+        if dataDevoluacao:
+            try:
+                y, m, d = dataDevoluacao.split("-")
+                data_ui = f"{d}/{m}/{y}"
+            except Exception:
+                data_ui = dataDevoluacao
+        else:
+            t_now = time.localtime()
+            data_ui = f"{t_now.tm_mday:02d}/{t_now.tm_mon:02d}/{t_now.tm_year}"
+
+        try:
+            result = await _do_nota_devolucao(idNota, data_ui, id_forma_pag, id_forma_envio, observacoes)
+        except Exception as e:
+            msg = str(e).lower()
+            motivo = "sessao-expirada" if "login" in msg or "sessao" in msg else "falha-automacao"
+            _log("criar_nota_devolucao", idNota, "erro-ui", started, {"erro": str(e)})
+            return {"ok": False, "motivo": motivo, "erro": str(e)}
+
+        _log("criar_nota_devolucao", idNota, "ok", started,
+             {"data": data_ui, "forma_pag": formaPagamento, "forma_envio": formaEnvio})
+        return {
+            "ok": True,
+            "idNota": idNota,
+            "data_devolucao": data_ui,
+            "forma_pagamento": formaPagamento,
+            "proximo_passo": "chamar gerar_nf_devolucao(idNota) para emitir a NF de entrada",
+        }
+
+    count += 1
+
+    @mcp.tool(
+        name="gerar_nf_devolucao",
+        description=(
+            "[UI v0] Gera a NF-e de devolucao (Nota de Entrada) a partir de uma devolucao de venda "
+            "ja criada. Encontra a devolucao na lista pelo ID da NF original de saida, clica em "
+            "'gerar nota de devolucao' e aguarda a NF ser criada. Retorna o idNota da NF de entrada. "
+            "Apos isso, use autorizar_nota_fiscal(idNota=<id_nf_devolucao>) para autorizar na SEFAZ. "
+            "Se a NF ja foi gerada anteriormente (botao [D] ja existe), retorna o id existente. "
+            "idNota: ID da NF-e de saida original (a que gerou a devolucao)."
+        ),
+    )
+    async def gerar_nf_devolucao(idNota: str) -> dict:
+        started = time.time()
+        try:
+            result = await _do_gerar_nf_devolucao(idNota)
+        except Exception as e:
+            msg = str(e).lower()
+            motivo = "sessao-expirada" if "login" in msg or "sessao" in msg else "falha-automacao"
+            _log("gerar_nf_devolucao", idNota, "erro-ui", started, {"erro": str(e)})
+            return {"ok": False, "motivo": motivo, "erro": str(e)}
+
+        _log("gerar_nf_devolucao", idNota, "ok", started,
+             {"id_nf_devolucao": result.get("id_nf_devolucao"),
+              "ja_existia": result.get("ja_existia", False)})
+        return {
+            "ok": True,
+            "idNota": idNota,
+            "id_nf_devolucao": result["id_nf_devolucao"],
+            "ja_existia": result.get("ja_existia", False),
+            "proximo_passo": (
+                f"chamar autorizar_nota_fiscal(idNota='{result['id_nf_devolucao']}') "
+                "para autorizar na SEFAZ"
+            ),
+        }
 
     count += 1
     return count
